@@ -14,38 +14,43 @@ export default async function handler(req, res) {
   const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
   try {
-    // ── 1. Adzuna ────────────────────────────────────────────────────────────
-    const adzunaUrl = `https://api.adzuna.com/v1/api/jobs/us/search/${page}?app_id=${ADZUNA_ID}&app_key=${ADZUNA_KEY}&results_per_page=20&what=${encodeURIComponent(query)}&what_or=education+nonprofit+edtech+learning&content-type=application/json`;
-    const adzunaRes = await fetch(adzunaUrl);
-    const adzunaData = await adzunaRes.json();
-    const adzunaJobs = (adzunaData.results || []).map(j => ({
-      id: j.id,
-      title: j.title,
-      org: j.company?.display_name || 'Unknown',
-      location: j.location?.display_name || 'Remote',
-      url: j.redirect_url,
-      description: j.description?.slice(0, 300) || '',
-      posted: j.created,
-      salary: j.salary_min ? `$${Math.round(j.salary_min/1000)}k–$${Math.round(j.salary_max/1000)}k` : 'Competitive',
-      source: 'Adzuna',
-    }));
+    // ── 1. Adzuna — fetch 3 pages in parallel for more results ───────────────
+    const adzunaPages = [1, 2, 3].map(p =>
+      fetch(`https://api.adzuna.com/v1/api/jobs/us/search/${p}?app_id=${ADZUNA_ID}&app_key=${ADZUNA_KEY}&results_per_page=50&what=${encodeURIComponent(query)}&what_or=education+nonprofit+edtech+learning&content-type=application/json`)
+        .then(r => r.json()).catch(() => ({ results: [] }))
+    );
+    const adzunaResults = await Promise.all(adzunaPages);
+    const adzunaJobs = adzunaResults.flatMap(data =>
+      (data.results || []).map(j => ({
+        id: j.id,
+        title: j.title,
+        org: j.company?.display_name || 'Unknown',
+        location: j.location?.display_name || 'Remote',
+        url: j.redirect_url,
+        description: j.description?.slice(0, 300) || '',
+        posted: j.created,
+        salary: j.salary_min ? `$${Math.round(j.salary_min/1000)}k–$${Math.round(j.salary_max/1000)}k` : 'Competitive',
+        source: 'Adzuna',
+      }))
+    );
 
     // ── 2. RSS Feeds ─────────────────────────────────────────────────────────
     const RSS_FEEDS = [
-      { url: 'https://www.idealist.org/en/jobs/rss?q=product+manager', source: 'Idealist' },
+      { url: `https://www.idealist.org/en/jobs/rss?q=${encodeURIComponent(query)}`, source: 'Idealist' },
       { url: 'https://jobs.edsurge.com/jobs.rss', source: 'EdSurge' },
-      { url: 'https://jobs.philanthropy.com/rss/jobs/?q=product+manager', source: 'Chronicle' },
-      { url: 'https://edtechjobs.io/jobs/rss?search=product+manager', source: 'EdTechJobs' },
+      { url: `https://jobs.philanthropy.com/rss/jobs/?q=${encodeURIComponent(query)}`, source: 'Chronicle' },
+      { url: `https://edtechjobs.io/jobs/rss?search=${encodeURIComponent(query)}`, source: 'EdTechJobs' },
+      { url: 'https://www.higheredjobs.com/rss/articleFeed.cfm', source: 'HigherEdJobs' },
     ];
 
     const rssResults = await Promise.allSettled(
       RSS_FEEDS.map(async ({ url, source }) => {
-        const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(5000) });
         const xml = await r.text();
         const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)];
-        return items.slice(0, 10).map(m => {
+        return items.slice(0, 25).map(m => {
           const get = (tag) => {
-            const match = m[1].match(new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\/${tag}>|<${tag}[^>]*>([\\s\\S]*?)<\/${tag}>`));
+            const match = m[1].match(new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>|<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`));
             return match ? (match[1] || match[2] || '').trim() : '';
           };
           return {
@@ -68,9 +73,10 @@ export default async function handler(req, res) {
       .flatMap(r => r.value)
       .filter(j => j.title);
 
-    // ── 3. Combine & Claude filter ───────────────────────────────────────────
+    // ── 3. Combine all sources ───────────────────────────────────────────────
     const allJobs = [...adzunaJobs, ...rssJobs];
 
+    // ── 4. Claude filter & enrich ────────────────────────────────────────────
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -80,14 +86,15 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
-        max_tokens: 2000,
-        system: `You are filtering job listings for an EdTech and nonprofit PM job board. 
-Given a list of jobs, return ONLY the ones relevant to product management in EdTech or nonprofit sectors.
-For each relevant job add: type ("edtech" or "nonprofit"), tags (array of 3 strings), logo (2 letter abbreviation of org name).
-Return a JSON array of the top 20 most relevant jobs. Raw JSON only, no markdown.`,
+        max_tokens: 4000,
+        system: `You are filtering job listings for an EdTech and nonprofit PM job board.
+Given a list of jobs, return the ones relevant to product management in EdTech or nonprofit sectors.
+Be inclusive — keep any PM, product, or product-adjacent roles at education or mission-driven orgs.
+For each relevant job add: type ("edtech" or "nonprofit"), tags (array of 3 short strings), logo (2 letter abbreviation of org name).
+Return a JSON array of up to 50 of the most relevant jobs. Raw JSON only, no markdown, no backticks.`,
         messages: [{
           role: 'user',
-          content: `Filter these jobs for EdTech/nonprofit PM relevance. User searched for: "${query}"\n\nJobs:\n${JSON.stringify(allJobs.slice(0, 40), null, 2)}`
+          content: `Filter these ${allJobs.length} jobs for EdTech/nonprofit PM relevance. User searched: "${query}"\n\nJobs:\n${JSON.stringify(allJobs.slice(0, 100), null, 2)}`
         }]
       })
     });
@@ -96,7 +103,7 @@ Return a JSON array of the top 20 most relevant jobs. Raw JSON only, no markdown
     const claudeText = claudeData.content?.map(c => c.text || '').join('') || '[]';
     const filtered = JSON.parse(claudeText.replace(/```json|```/g, '').trim());
 
-    res.status(200).json({ jobs: filtered, total: filtered.length });
+    res.status(200).json({ jobs: filtered, total: filtered.length, raw: allJobs.length });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
